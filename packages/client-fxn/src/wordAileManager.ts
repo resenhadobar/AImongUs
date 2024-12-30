@@ -1,315 +1,313 @@
 import {FxnClient} from "./fxnClient.ts";
-import fs from 'fs/promises';
-import path from 'path';
 
-import wordList from './utils/words.ts';
-
-interface BoardState {
-    guesses: string[];
-    feedback: string[];
-    guessCount: number;      // Track number of guesses (0-5)
-    isComplete: boolean;     // Player has either won or used all guesses
-    wonRound: boolean;       // Whether player won this round
+interface PlayerRole {
+    type: 'crewmate' | 'impostor';
+    room: number;  // 0-5 for the 6 rooms
 }
 
-interface WinnerRecord {
+interface PlayerAction {
+    type: 'accuse' | 'pass' | 'kill';
+    target?: string;  // publicKey of target for accuse/kill
+    accusationText?: string;  // What they say when accusing
+}
+
+interface PlayerMovement {
+    type: 'stay' | 'clockwise' | 'counterclockwise';
+}
+
+interface PlayerVote {
+    target: string | null;  // publicKey of voted player, null for skip
+    voteText: string;  // What they say when voting
+}
+
+interface PlayerState {
     publicKey: string;
-    wins: number;
-    timestamp: number;
-    transactionHash?: string;
-}
-
-interface WinnerHistory {
-    winners: WinnerRecord[];
+    role: PlayerRole;
+    isAlive: boolean;
+    lastAction?: PlayerAction;
+    lastMovement?: PlayerMovement;
+    lastVote?: PlayerVote;
 }
 
 interface GameState {
-    currentWord: string;
-    lastWord: string | null;
-    roundStartTime: number;
-    boardStates: Map<string, BoardState>;
-    winners: Map<string, number>;  // Track wins per player
-    roundWinners: Set<string>;  // Track winners for current round
+    players: Map<string, PlayerState>;
+    phase: 'action' | 'movement' | 'voting' | 'complete';
+    currentRound: number;
+    actionOrder: string[];  // Array of publicKeys in action order
+    accusedPlayer?: string;  // publicKey of player being voted on
+    votingResults?: Map<string, string>;  // voter publicKey -> voted publicKey
     isActive: boolean;
-    roundNumber: number;
-    participants: Set<string>;
+    winner?: 'crew' | 'impostors';
 }
 
-export class WordAileManager {
+export class AmongUsManager {
     private gameState: GameState;
-    public readonly ROUND_DURATION = 5 * 60 * 1000;  // 5 minutes per round
-    private readonly GUESS_DURATION = 60 * 1000;      // 10 seconds between guesses
-    private readonly MAX_GUESSES = 5;
-    private readonly WINS_NEEDED = 3;
+    private readonly ROUND_DURATION = 2 * 60 * 1000;  // 2 minutes per round
+    private readonly ACTION_DURATION = 30 * 1000;     // 30 seconds for actions
+    private readonly MOVEMENT_DURATION = 15 * 1000;   // 15 seconds for movement
+    private readonly VOTING_DURATION = 45 * 1000;     // 45 seconds for voting
     private roundTimer: NodeJS.Timeout | null = null;
-    private guessTimer: NodeJS.Timeout | null = null;
-    private readonly WINNERS_FILE_PATH = path.join(process.cwd(), 'game-winners.json');
-    private lastWinner: string | null = null;
-
+    private phaseTimer: NodeJS.Timeout | null = null;
 
     constructor(private fxnClient: FxnClient) {
         this.gameState = this.initializeGameState();
-        this.startRoundTimer().then(r => {
-            console.log('Game Master initialized');
-        });
-    }
-    public async loadWinnerHistory(): Promise<WinnerHistory> {
-        try {
-            const data = await fs.readFile(this.WINNERS_FILE_PATH, 'utf8');
-            return JSON.parse(data);
-        } catch (error) {
-            // If file doesn't exist or is invalid, return empty history
-            return { winners: [] };
-        }
-    }
-
-    private async saveWinner(publicKey: string, wins: number, transactionHash: string) {
-        try {
-            const history = await this.loadWinnerHistory();
-            history.winners.push({
-                publicKey,
-                wins,
-                timestamp: Date.now(),
-                transactionHash
-            });
-            await fs.writeFile(this.WINNERS_FILE_PATH, JSON.stringify(history, null, 2));
-        } catch (error) {
-            console.error('Error saving winner:', error);
-            throw error;
-        }
+        this.startGame();
     }
 
     private initializeGameState(): GameState {
         return {
-            currentWord: this.selectRandomWord(),
-            roundStartTime: Date.now(),
-            lastWord: null,
-            boardStates: new Map(),
-            winners: new Map(),
-            roundWinners: new Set(),
-            isActive: true,
-            roundNumber: 1,
-            participants: new Set()
+            players: new Map(),
+            phase: 'action',
+            currentRound: 1,
+            actionOrder: [],
+            isActive: true
         };
     }
 
-    private selectRandomWord(): string {
-        const wordIndex = Math.floor(Math.random() * (wordList.length)) + 1;
-        return wordList[wordIndex];
-    }
-
-    private async startRoundTimer() {
-        if (this.roundTimer) {
-            clearTimeout(this.roundTimer);
-        }
-
-        // Start new guess cycle
-        await this.startGuessCycle();
-
-        // Set timer for round end
-        this.roundTimer = setTimeout(() => this.startNewRound(), this.ROUND_DURATION);
-    }
-
-    public async handleGuess(publicKey: string, guess: string): Promise<{
-        boardState: BoardState,
-        roundOver: boolean,
-        gameOver: boolean,
-        winner?: string
-    }> {
-        console.log('Handling guess', guess, publicKey);
-
-        let boardState = this.gameState.boardStates.get(publicKey);
-        if (!boardState) {
-            boardState = this.initializeBoardState();
-            this.gameState.boardStates.set(publicKey, boardState);
-        }
-
-        // Check if player can still make guesses
-        if (boardState.isComplete || boardState.guessCount >= this.MAX_GUESSES) {
-            return {
-                boardState,
-                roundOver: false,
-                gameOver: false
+    private assignRoles(players: string[]): void {
+        // Shuffle players
+        const shuffled = [...players].sort(() => Math.random() - 0.5);
+        
+        // Assign 2 impostors and rest as crew
+        shuffled.forEach((publicKey, index) => {
+            const role: PlayerRole = {
+                type: index < 2 ? 'impostor' : 'crewmate',
+                room: Math.floor(Math.random() * 6) // Random room 0-5
             };
-        }
 
-        // Process guess and get feedback
-        const feedback = this.checkGuess(guess);
-        boardState.guesses.push(guess);
-        boardState.feedback.push(feedback);
-        boardState.guessCount++;
-
-        // Check if player won with this guess
-        const isWinner = feedback === '🟩🟩🟩🟩🟩';
-        console.log('isWinner?', isWinner);
-        if (isWinner) {
-            boardState.wonRound = true;
-            boardState.isComplete = true;
-            console.log('adding winner', publicKey);
-            this.gameState.roundWinners.add(publicKey);  // Add to round winners
-        } else if (boardState.guessCount >= this.MAX_GUESSES) {
-            // Player used all guesses without winning
-            boardState.isComplete = true;
-        }
-
-        // Update the state
-        this.gameState.boardStates.set(publicKey, boardState);
-
-        const allPlayersOutOfGuesses = this.areAllPlayersOutOfGuesses();
-        if (allPlayersOutOfGuesses) {
-            // Start new round since no one can guess anymore
-            await this.startNewRound();
-            return {
-                boardState,
-                roundOver: true,
-                gameOver: false
-            };
-        }
-
-        return {
-            boardState,
-            roundOver: false,
-            gameOver: false
-        };
-    }
-
-
-    private checkGuess(guess: string): string {
-        let feedback = '';
-        for (let i = 0; i < guess.length; i++) {
-            if (guess[i] === this.gameState.currentWord[i]) {
-                feedback += '🟩';
-            } else if (this.gameState.currentWord.includes(guess[i])) {
-                feedback += '🟨';
-            } else {
-                feedback += '⬜';
-            }
-        }
-        return feedback;
-    }
-
-    private async startGuessCycle() {
-        if (this.guessTimer) {
-            clearTimeout(this.guessTimer);
-        }
-
-        await this.broadcastRound();
-
-        // Set timer for next guess cycle
-        this.guessTimer = setTimeout(() => this.startGuessCycle(), this.GUESS_DURATION);
-    }
-
-    private initializeBoardState(): BoardState {
-        return {
-            guesses: [],
-            feedback: [],
-            guessCount: 0,
-            isComplete: false,
-            wonRound: false
-        };
-    }
-
-    private async startNewRound() {
-        // Update the last word
-        this.gameState.lastWord = this.gameState.currentWord;
-
-        // First, update all winners' scores
-        console.log('round winners are ', this.gameState.roundWinners);
-        this.gameState.roundWinners.forEach(publicKey => {
-            const currentWins = (this.gameState.winners.get(publicKey) || 0) + 1;
-            this.gameState.winners.set(publicKey, currentWins);
+            this.gameState.players.set(publicKey, {
+                publicKey,
+                role,
+                isAlive: true
+            });
         });
-
-        console.log('global winners are ', this.gameState.winners);
-        // Now check for game end condition
-        const playersWithMaxWins = Array.from(this.gameState.winners.entries())
-            .filter(([_, wins]) => wins >= this.WINS_NEEDED);
-
-        // If we have players with enough wins, check for a clear winner
-        if (playersWithMaxWins.length > 0) {
-            // Find the highest win count
-            const maxWins = Math.max(...playersWithMaxWins.map(([_, wins]) => wins));
-            // Get all players with the highest win count
-            const winners = playersWithMaxWins.filter(([_, wins]) => wins === maxWins);
-
-            // If there's exactly one winner with the highest score, end the game
-            if (winners.length === 1) {
-                await this.endGame(winners[0][0]); // winners[0][0] is the publicKey
-                return;
-            }
-            // Otherwise (if there's a tie), continue to the next round
-        }
-
-        // Reset for new round
-        this.gameState.currentWord = this.selectRandomWord();
-        this.gameState.roundStartTime = Date.now();
-        this.gameState.roundNumber++;
-        this.gameState.roundWinners.clear();
-
-        // Reset board states for new round
-        this.gameState.boardStates.forEach((_, publicKey) => {
-            this.gameState.boardStates.set(publicKey, this.initializeBoardState());
-        });
-
-        await this.startRoundTimer();
     }
 
-    private areAllPlayersOutOfGuesses(): boolean {
-        // If there are no board states, return false
-        if (this.gameState.boardStates.size === 0) {
-            return false;
-        }
-
-        // Check if all players have either:
-        // 1. Used all their guesses, or
-        // 2. Completed their game (won or lost)
-        return Array.from(this.gameState.boardStates.values()).every(
-            boardState => boardState.isComplete || boardState.guessCount >= this.MAX_GUESSES
-        );
-    }
-
-    public getCurrentRoundStartTime(): number {
-        return this.gameState.roundStartTime;
-    }
-
-    private async broadcastRound() {
+    private async startGame(): Promise<void> {
         const subscribers = await this.fxnClient.getSubscribers();
-        console.log('Current board states before broadcast:',
-            Array.from(this.gameState.boardStates.entries())
-                .map(([key, value]) => ({
-                    key,
-                    guesses: value.guesses,
-                    feedback: value.feedback
+        let activePlayers = subscribers
+            .filter(sub => sub.status === 'active')
+            .map(sub => sub.subscriber.toString());
+
+        // Add bot players if needed
+        while (activePlayers.length < 6) {
+            activePlayers.push(`bot-${activePlayers.length + 1}`);
+        }
+
+        this.assignRoles(activePlayers);
+        this.gameState.actionOrder = this.shuffleActionOrder();
+        await this.startRound();
+    }
+
+    private shuffleActionOrder(): string[] {
+        return Array.from(this.gameState.players.keys())
+            .filter(key => this.gameState.players.get(key)?.isAlive)
+            .sort(() => Math.random() - 0.5);
+    }
+
+    private async startRound(): Promise<void> {
+        if (!this.gameState.isActive) return;  // Add guard clause
+        
+        this.gameState.phase = 'action';
+        this.gameState.actionOrder = this.shuffleActionOrder();
+        
+        // Clear previous timers
+        if (this.phaseTimer) {
+            clearTimeout(this.phaseTimer);
+        }
+        
+        await this.broadcastGameState();
+        this.phaseTimer = setTimeout(() => this.startMovementPhase(), this.ACTION_DURATION);
+    }
+
+
+    private async startMovementPhase(): Promise<void> {
+        this.gameState.phase = 'movement';
+        await this.broadcastGameState();
+        
+        this.phaseTimer = setTimeout(() => this.processRound(), this.MOVEMENT_DURATION);
+    }
+
+    private async startVotingPhase(accusedPlayer: string): Promise<void> {
+        this.gameState.phase = 'voting';
+        this.gameState.accusedPlayer = accusedPlayer;
+        this.gameState.votingResults = new Map();
+        await this.broadcastGameState();
+
+        this.phaseTimer = setTimeout(() => this.processVotes(), this.VOTING_DURATION);
+    }
+
+    private async processVotes(): Promise<void> {
+        if (!this.gameState.votingResults || !this.gameState.accusedPlayer) return;
+        
+        const votes = new Map<string, number>();
+        votes.set('skip', 0);
+
+        // Count votes
+        this.gameState.votingResults.forEach((target) => {
+            votes.set(target, (votes.get(target) || 0) + 1);
+        });
+
+        // Find highest vote count
+        let maxVotes = 0;
+        let ejected: string | null = null;
+        votes.forEach((count, target) => {
+            if (count > maxVotes) {
+                maxVotes = count;
+                ejected = target;
+            }
+        });
+
+        // Eject player if majority
+        if (ejected && ejected !== 'skip') {
+            const player = this.gameState.players.get(ejected);
+            if (player) player.isAlive = false;
+        }
+
+        await this.checkWinCondition();
+        if (this.gameState.isActive) {
+            await this.startRound();
+        }
+    }
+
+    private async processRound(): Promise<void> {
+        console.log("Processing round...");
+        console.log("All player states before processing:", 
+            Array.from(this.gameState.players.values())
+                .map(p => ({
+                    publicKey: p.publicKey,
+                    lastAction: p.lastAction,
+                    lastMovement: p.lastMovement,
+                    role: p.role,
+                    isAlive: p.isAlive
                 }))
         );
+        
+        // Clear any existing timers
+        if (this.phaseTimer) {
+            clearTimeout(this.phaseTimer);
+            this.phaseTimer = null;
+        }
+        if (this.roundTimer) {
+            clearTimeout(this.roundTimer);
+            this.roundTimer = null;
+        }
+        
+        // Process kills first
+        for (const [publicKey, player] of this.gameState.players.entries()) {
+            if (player.lastAction?.type === 'kill' && player.lastAction.target) {
+                const target = this.gameState.players.get(player.lastAction.target);
+                if (target && target.isAlive && player.role.type === 'impostor') {
+                    // Verify same room and impostor status
+                    if (target.role.room === player.role.room) {
+                        target.isAlive = false;
+                        console.log(`Player ${target.publicKey} was killed by ${player.publicKey}`);
+                    }
+                }
+            }
+        }
+    
+        // Update positions based on movements
+        for (const [publicKey, player] of this.gameState.players.entries()) {
+            if (player.lastMovement?.type === 'clockwise') {
+                player.role.room = (player.role.room + 1) % 6;
+            } else if (player.lastMovement?.type === 'counterclockwise') {
+                player.role.room = (player.role.room + 5) % 6;
+            }
+        }
+    
+        // Clear only the action/movement records while preserving states
+        for (const [publicKey, player] of this.gameState.players.entries()) {
+            player.lastAction = undefined;
+            player.lastMovement = undefined;
+        }
+    
+        console.log("All player states after processing:", 
+            Array.from(this.gameState.players.values())
+                .map(p => ({
+                    publicKey: p.publicKey,
+                    room: p.role.room,
+                    isAlive: p.isAlive,
+                    role: p.role
+                }))
+        );
+    
+        await this.checkWinCondition();
+        console.log("Game state after win condition check:", {
+            isActive: this.gameState.isActive,
+            winner: this.gameState.winner,
+            alivePlayers: Array.from(this.gameState.players.values())
+                .filter(p => p.isAlive).length
+        });
 
-        const promises = subscribers.map(async (subscriber) => {
+        if (this.gameState.isActive) {
+            this.gameState.currentRound++;
+            await this.startRound();
+        } else {
+            // Broadcast final game state
+            await this.broadcastGameState();
+        }
+    }
+
+    private async broadcastGameState(): Promise<void> {
+        const subscribers = await this.fxnClient.getSubscribers();
+        console.log('Broadcasting game state to subscribers:', subscribers);
+        
+        // Handle real players
+        const promises = subscribers.map(async subscriber => {
             try {
                 const publicKey = subscriber.subscriber.toString();
-                const recipient = subscriber.subscription?.recipient;
-                const currentBoardState = this.getBoardState(publicKey);
-
-                // Only check if the subscriber is active
-                if (recipient && subscriber.status === 'active') {
-                    // Always broadcast the state, but only accept new guesses if the board isn't complete
-                    const response = await this.fxnClient.broadcastToSubscribers({
-                        boardState: currentBoardState,
-                        roundNumber: this.gameState.roundNumber
-                    }, subscribers);
-
-                    console.log('Broadcast response is ', response);
-
-                    // Only process new guesses if the board isn't complete
-                    if (!currentBoardState.isComplete &&
-                        currentBoardState.guessCount < this.MAX_GUESSES &&
-                        response &&
-                        response[0]['value'] &&
-                        response[0]['value']['ok']) {
-                        const responseData = await response[0]['value'].json();
-                        const guess = responseData.guess;
-
-                        if (guess && typeof guess === 'string' && guess.length === 5) {
-                            await this.handleGuess(publicKey, guess);
+                const playerView = this.getPlayerView(publicKey);
+                
+                if (subscriber.status === 'active') {
+                    const formattedMessage = {
+                        gameState: playerView,
+                        type: 'game_update'
+                    };
+                    
+                    console.log(`Broadcasting to ${publicKey}:`, formattedMessage);
+                    
+                    const response = await this.fxnClient.broadcastToSubscribers(
+                        formattedMessage, 
+                        [subscriber]
+                    );
+                    
+                    if (response?.[0]?.status === 'fulfilled') {
+                        const result = (response[0] as PromiseFulfilledResult<Response>).value;
+                        if (result.ok) {
+                            const responseData = await result.json();
+                            console.log(`Raw response data from ${publicKey}:`, responseData);
+                            
+                            const player = this.gameState.players.get(publicKey);
+                            if (!player || !player.isAlive) return;
+                    
+                            switch (this.gameState.phase) {
+                                case 'action':
+                                    if (responseData.type) {
+                                        // Validate kill actions
+                                        if (responseData.type === 'kill') {
+                                            if (player.role.type !== 'impostor') {
+                                                responseData.type = 'pass';
+                                            }
+                                        }
+                                        player.lastAction = responseData;
+                                        console.log(`Updated action for ${publicKey}:`, player.lastAction);
+                                    }
+                                    break;
+                                case 'movement':
+                                    if (responseData.type) {
+                                        player.lastMovement = responseData;
+                                        console.log(`Updated movement for ${publicKey}:`, player.lastMovement);
+                                    }
+                                    break;
+                                case 'voting':
+                                    if (responseData.target !== undefined) {
+                                        player.lastVote = responseData;
+                                        this.gameState.votingResults?.set(publicKey, responseData.target || 'skip');
+                                        console.log(`Updated vote for ${publicKey}:`, player.lastVote);
+                                    }
+                                    break;
+                            }
                         }
                     }
                 }
@@ -317,102 +315,107 @@ export class WordAileManager {
                 console.error(`Error communicating with subscriber:`, error);
             }
         });
+    
+        // Handle bot players
+        for (const [publicKey, player] of this.gameState.players.entries()) {
+            if (publicKey.startsWith('bot-') && player.isAlive) {
+                const playerView = this.getPlayerView(publicKey);
+                const botDecision = await this.makeBotDecision(playerView);
+
+                switch (this.gameState.phase) {
+                    case 'action':
+                        player.lastAction = botDecision;
+                        break;
+                    case 'movement':
+                        player.lastMovement = botDecision;
+                        break;
+                    case 'voting':
+                        player.lastVote = botDecision;
+                        this.gameState.votingResults?.set(publicKey, botDecision.target || 'skip');
+                        break;
+                }
+            }
+        }
 
         await Promise.all(promises);
     }
 
+    private async checkWinCondition(): Promise<void> {
+        const alivePlayers = Array.from(this.gameState.players.values())
+            .filter(p => p.isAlive);
+        
+        const aliveImpostors = alivePlayers
+            .filter(p => p.role.type === 'impostor').length;
+        
+        const aliveCrew = alivePlayers.length - aliveImpostors;
 
-    private async endGame(winnerPubKey: string) {
-        if (this.roundTimer) {
-            clearTimeout(this.roundTimer);
-        }
-        const wins = this.gameState.winners.get(winnerPubKey) || 0;
-        this.lastWinner = winnerPubKey;
+        console.log("Win condition check:", {
+            alivePlayers: alivePlayers.length,
+            aliveImpostors,
+            aliveCrew
+        });
 
-        try {
-            // First distribute the reward
-            const rewardResult = await this.distributeReward(winnerPubKey);
-            if (rewardResult.status === 'error') {
-                console.log('Error distributing reward:', rewardResult.message);
-            }
-
-            // Then save the winner with the transaction hash
-            await this.saveWinner(winnerPubKey, wins, rewardResult.signature);
-
-            // Start a new game
-            await this.startNewGame();
-        } catch (error) {
-            console.error('Error in endGame:', error);
-            // Don't rethrow - just log and continue with new game
-            await this.startNewGame();
+        if (aliveImpostors === 0) {
+            this.gameState.isActive = false;
+            this.gameState.winner = 'crew';
+        } else if (aliveCrew === 0) {
+            this.gameState.isActive = false;
+            this.gameState.winner = 'impostors';
         }
     }
 
-    private async startNewGame() {
-        // Reset game state
-        this.gameState = this.initializeGameState();
 
-        // Start the timers again
-        await this.startRoundTimer();
+    private getPlayerView(publicKey: string): any {
+        const player = this.gameState.players.get(publicKey);
+        const isImpostor = player?.role.type === 'impostor';
 
-        console.log('New game started');
+        return {
+            phase: this.gameState.phase,
+            currentRound: this.gameState.currentRound,
+            actionOrder: this.gameState.actionOrder,
+            accusedPlayer: this.gameState.accusedPlayer,
+            yourRole: player?.role,
+            players: Array.from(this.gameState.players.values()).map(p => ({
+                publicKey: p.publicKey,
+                isAlive: p.isAlive,
+                room: p.role.room,
+                role: isImpostor ? p.role.type : undefined,
+                lastAction: p.lastAction,
+                lastVote: p.lastVote
+            })),
+            winner: this.gameState.winner
+        };
     }
 
-    private async distributeReward(winnerPubKey: string) {
-        try {
-            const result = await this.fxnClient.transferRewardTokens(winnerPubKey, 20);
+    private async makeBotDecision(gameState: any): Promise<any> {
+        const isImpostor = gameState.yourRole.type === 'impostor';
+        const phase = gameState.phase;
 
-            if (result.status === 'error') {
-                return {status: 'error', message: `Failed to distribute reward: ${result.message}`, signature: ''};
-            }
+        switch (phase) {
+            case 'action':
+                if (isImpostor && Math.random() < 0.3) { // 30% chance to kill
+                    const potentialTargets = gameState.players.filter((p: any) => 
+                        p.isAlive && p.room === gameState.yourRole.room && !p.role
+                    );
+                    if (potentialTargets.length > 0) {
+                        const target = potentialTargets[Math.floor(Math.random() * potentialTargets.length)];
+                        return { type: 'kill', target: target.publicKey };
+                    }
+                }
+                return { type: 'pass' };
 
-            console.log(`Reward distribution successful: ${result.message}`);
-            return result;
-        } catch (error) {
-            console.error(`Error distributing reward to ${winnerPubKey}:`, error);
-            return {status: 'error', message: `Failed to distribute reward: ${error}`, signature: ''};
+            case 'movement':
+                const movements = ['stay', 'clockwise', 'counterclockwise'];
+                return { type: movements[Math.floor(Math.random() * movements.length)] };
+
+            case 'voting':
+                if (Math.random() < 0.7) { // 70% chance to vote for accused
+                    return { target: gameState.accusedPlayer, voteText: 'Suspicious behavior' };
+                }
+                return { target: null, voteText: 'Not enough evidence' };
+
+            default:
+                return { type: 'pass' };
         }
-    }
-
-    public getBoardState(publicKey: string): BoardState {
-        return this.gameState.boardStates.get(publicKey) || this.initializeBoardState();
-    }
-
-    public getAllBoardStates(): Map<string, BoardState> {
-        return this.gameState.boardStates;
-    }
-
-    public getLastWord(): string | null {
-        return this.gameState.lastWord;
-    }
-
-    public getPlayerHistory(publicKey: string): boolean[] {
-        const totalRounds = this.gameState.roundNumber - 1; // Current round number minus 1
-        const wins = this.gameState.winners.get(publicKey) || 0;
-        const losses = totalRounds - wins;
-
-        // Create an array of results based on wins and losses
-        const results: boolean[] = [];
-        for (let i = 0; i < wins; i++) results.push(true);
-        for (let i = 0; i < losses; i++) results.push(false);
-
-        return results;
-    }
-
-    public getRoundDuration(): number {
-        return this.ROUND_DURATION;
-    }
-
-    public getLastWinner(): string | null {
-        return this.lastWinner;
-    }
-
-    public getRoundNumber(): number {
-        return this.gameState.roundNumber;
-    }
-
-    public async getPlayerCount(): Promise<number> {
-        const subscribers = await this.fxnClient.getSubscribers();
-        return subscribers.filter(sub => sub.status === 'active').length;
     }
 }
